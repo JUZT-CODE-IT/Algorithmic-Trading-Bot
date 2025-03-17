@@ -2,6 +2,7 @@
     "version": "0.2.0",
     "configurations": [      
         
+        
         {
             "name": "Python: Current File",
             "type": "debugpy",
@@ -26,6 +27,26 @@
                 "port": 5678
             }
             "justMyCode": false
+        },
+
+        {
+                "type": "chrome",
+                "request": "launch",
+                "name": "Launch React App",
+                "url": "http://localhost:3000",
+                "webRoot": "${workspaceFolder}/src"
         }
+        {
+            "name": "Flask: Python",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/app.py",  // Path to your Flask app
+            "console": "integratedTerminal",
+            "env": {
+              "FLASK_APP": "app.py",
+              "FLASK_ENV": "development"
+            },
+            "envFile": "${workspaceFolder}/.env"
+          }
     ]
 }

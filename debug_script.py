@@ -1,9 +1,8 @@
 import debugpy
 
-# Disconnect previous debug sessions
+# Check if a client is already connected (optional)
 if debugpy.is_client_connected():
-    debugpy.disconnect()
-    print("Previous debugger session closed.")
+    print("A debugger is already connected. Restart VS Code if needed.")
 
 # Start a new debug session
 debugpy.listen(("localhost", 5678))
