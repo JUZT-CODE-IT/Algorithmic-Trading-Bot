@@ -4,18 +4,25 @@ import os
 import numpy as np
 import pandas as pd
 import joblib
+import xgboost as xgb
 import alpaca_trade_api as tradeapi
 import tensorflow as tf
 import matplotlib.pyplot as plt
+import requests
 from datetime import datetime, timedelta
-from tensorflow.keras.models import Sequential
+import matplotlib.animation as animation
+from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import MinMaxScaler
 from dotenv import load_dotenv
+from imblearn.over_sampling import SMOTE
 from lumibot.brokers import Alpaca
 from lumibot.strategies import Strategy
 from lumibot.traders import Trader
+from lumibot.entities import Order
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 load_dotenv("setup.env")
 
@@ -32,19 +39,32 @@ restAPI = tradeapi.REST(
 )
 
 class ML_Trend(Strategy):
-    def __init__(self, broker, selected_symbol, stock_name):
-        super().__init__(broker)
+    def __init__(self, selected_symbol, stock_name, broker=None):
+        if broker:
+            super().__init__(broker)
         self.broker = broker
         self.selected_symbol = selected_symbol
         self.stock_name = stock_name
-        self.model = self.load_model()
 
-    def load_model(self):
+        self.data = self.get_historical_prices(self.selected_symbol, 1000, "day")
+
+        self.lstm_model = self.load_lstm_model()
+        self.xgb_model = self.load_xgb_model()
+
+    def load_lstm_model(self):
         try:
-            model = joblib.load("model.pkl")
+            model = load_model("lstm_model.h5")
             return model
         except Exception as e:
-            print("Error loading model:", e)
+            print("Error loading LSTM model:", e)
+            return None
+
+    def load_xgb_model(self):
+        try:
+            model = joblib.load("xgboost_model.pkl")
+            return model
+        except Exception as e:
+            print("Error loading XGBoost model:", e)
             return None
 
     @staticmethod
@@ -63,6 +83,58 @@ class ML_Trend(Strategy):
         signal_line = macd.ewm(span=signal_period, adjust=False).mean()
         return macd, signal_line, macd - signal_line
 
+    @staticmethod
+    def calculate_bollinger_bands(data, window=20):
+        data['SMA'] = data['close'].rolling(window=window).mean()
+        data['STD']= data['close'].rolling(window=window).std()
+        data['Upper_Band']= data['SMA'] + (data['STD'] * 2)
+        data['Lower_Band']= data['SMA'] - (data['STD'] * 2)
+        data['BB_Width']= (4*data['STD'])/data['SMA']
+        data['%B']=(data['close']-data['Lower_Band'])/4*data['STD']
+        return data
+
+    @staticmethod
+    def calculate_volatility(data, window=20):
+        data['Volatility'] = data['close'].pct_change().rolling(window=window).std()
+        return data
+
+    @staticmethod
+    def calculate_atr(data, period=14):
+        high_low = data['high'] - data['low']
+        high_close = (data['high'] - data['close'].shift()).abs()
+        low_close = (data['low'] - data['close'].shift()).abs()
+
+        true_range = high_low.combine(high_close, max).combine(low_close, max)
+        atr = true_range.rolling(window=period, min_periods=1).mean()
+
+        data['ATR'] = atr
+        return data
+    
+    @staticmethod
+    def plot_live(self):
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        def update(frame):
+            ax.clear()
+            ax.plot(self.balance_history, label="Portfolio Balance", color="blue", linewidth=2)
+
+            # Plot buy/sell points
+            for trade in self.trades:
+                index, price, trade_type = trade
+                if trade_type == "BUY":
+                    ax.scatter(index, self.balance_history[index - 50], color="green", marker="^", s=100, label="BUY" if index == self.trades[0][0] else "")
+                elif trade_type == "SELL":
+                    ax.scatter(index, self.balance_history[index - 50], color="red", marker="v", s=100, label="SELL" if index == self.trades[0][0] else "")
+
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Portfolio Value ($)")
+            ax.set_title("Live Trading Performance")
+            ax.legend()
+            ax.grid(True)
+
+        ani = animation.FuncAnimation(fig, update, interval=1000)  # Update every second
+        plt.show()
+
     def create_sequences(self, features, labels, sequence_length):
         X, y = [], []
         for i in range(len(features) - sequence_length):
@@ -75,76 +147,271 @@ class ML_Trend(Strategy):
         self.force_start_immediately = True
         self.ignore_market_hours = True
 
-        historical_data = self.get_historical_prices(self.selected_symbol, 730, "day")
-        if historical_data is None:
+        if self.data is None:
             print(f"Error: No historical data found for {self.selected_symbol}")
             return
 
-        self.data = historical_data.df
+        self.data = self.data.df
+        print(self.data.columns)
         self.data['RSI'] = self.calculate_rsi(self.data['close'])
         self.data['MACD'], _, _ = self.calculate_macd(self.data['close'])
+        self.data = self.calculate_bollinger_bands(self.data)
+        self.data = self.calculate_volatility(self.data)
+        self.data = self.calculate_atr(self.data)
+        self.data['Momentum'] = (self.data['close'] - self.data['close'].shift(5)) / self.data['close'].shift(5)
+        self.data['Price_Change'] = (self.data['close'] - self.data['open']) / self.data['open']
+        correlation = self.data[['ATR', 'Volatility']].corr()
+        self.features = self.data[['RSI', 'MACD', 'SMA','BB_Width','%B', 'Volatility','ATR', 'Momentum', 'Price_Change']]
         self.data.dropna(inplace=True)
 
-        self.features = self.data[['RSI', 'MACD']]
+        scaler = MinMaxScaler()
+        self.features = pd.DataFrame(scaler.fit_transform(self.features.copy()),columns=self.features.columns,index=self.features.index)
+        joblib.dump(scaler,"scaler.pkl")
         self.labels = (self.data['close'].shift(-1) > self.data['close']).astype(int)
+        self.labels.dropna(inplace=True)
+        # unique, counts = np.unique(self.labels, return_counts=True)
+        # print(dict(zip(unique, counts)))
+        self.features = self.features[:len(self.labels)]
 
-        sequence_length = 30
-        X_train, y_train = self.create_sequences(self.features, self.labels, sequence_length)
+        split = int(len(self.features) * 0.70)
+        X_train, X_test = self.features.iloc[:split], self.features.iloc[split:]
+        y_train, y_test = self.labels.iloc[:split], self.labels.iloc[split:]
 
-        self.model = Sequential([
-            LSTM(128, activation='relu', return_sequences=True),
-            Dropout(0.2),
-            LSTM(64, activation='relu', return_sequences=True),
-            Dropout(0.2),
-            LSTM(32, activation='relu'),
-            Dense(16, activation='relu'),
+        sequence_length = 50
+        X_train_seq, y_train_seq = self.create_sequences(X_train, y_train, sequence_length)
+        X_test_seq, y_test_seq = self.create_sequences(X_test, y_test, sequence_length)
+
+
+        # Train LSTM
+        self.lstm_model = Sequential([
+            LSTM(256, activation='tanh', return_sequences=True),
+            Dropout(0.3),
+            LSTM(128, activation='tanh', return_sequences=True),
+            Dropout(0.3),
+            LSTM(64, activation='tanh'),
+            Dense(32, activation='relu'),
             Dense(1, activation='sigmoid')
         ])
+        self.lstm_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        self.lstm_model.fit(X_train_seq, y_train_seq, epochs=50, batch_size=64)
+        self.lstm_model.save("lstm_model.h5")
 
-        self.model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        self.model.fit(X_train, y_train, epochs=50, batch_size=64)
+        y_pred_lstm = self.lstm_model.predict(X_test_seq)
+        y_pred_lstm = (y_pred_lstm > 0.5).astype(int)
+        LSTM_Accuracy = accuracy_score(y_test_seq, y_pred_lstm)
+        LSTM_F1 = f1_score(y_test_seq, y_pred_lstm)
 
-        joblib.dump(self.model, "model.pkl")
+        print(f"LSTM_Accuracy: {LSTM_Accuracy:.4f}")
+        print(f"LSTM_F1: {LSTM_F1:.4f}")
 
-        # Accuracy & F1 Score Calculation
-        y_pred = (self.model.predict(X_train) > 0.5).astype(int)
-        accuracy = accuracy_score(y_train, y_pred)
-        f1 = f1_score(y_train, y_pred)
+        self.features.dropna(inplace=True)
+        self.labels = self.labels[self.features.index]  # Keep labels aligned with features
+        # Train XGBoost
+        smote = SMOTE()
+        X_resampled, y_resampled = smote.fit_resample(self.features, self.labels)
+        self.xgb_model = xgb.XGBClassifier(
+            n_estimators=500,  
+            learning_rate=0.02,  
+            max_depth=4,  
+            subsample=0.8,  
+            colsample_bytree=0.8,  
+            random_state=42
+        )
 
-        print(f"Training Accuracy: {accuracy:.4f}")
-        print(f"Training F1 Score: {f1:.4f}")
+
+        self.xgb_model.fit(X_resampled, y_resampled)
+        xgb.plot_importance(self.xgb_model)
+        plt.savefig("Output.png")  
+        joblib.dump(self.xgb_model, "xgboost_model.pkl")
+
+        y_pred_xgb = self.xgb_model.predict(X_test)
+        y_pred_xgb = (y_pred_xgb > 0.5).astype(int)
+        XGBoost_Accuracy = accuracy_score(y_test, y_pred_xgb)
+        XGBoost_F1 = f1_score(y_test, y_pred_xgb)
+
+        print(f"XGBoost_Accuracy: {XGBoost_Accuracy:.4f}")
+        print(f"XGBoost_F1: {XGBoost_F1:.4f}")
 
     def on_trading_iteration(self):
-        bars = self.get_historical_prices(self.selected_symbol, 500, "day")
-        gld = bars.df
+        bars = restAPI.get_barset([self.selected_symbol], timeframe="minute", limit=120).df
 
-        if gld.empty:
+        if bars is None:
             print("No data available.")
             return
 
-        gld['RSI'] = self.calculate_rsi(gld['close'])
-        gld['MACD'], _, _ = self.calculate_macd(gld['close'])
-        gld.dropna(inplace=True)
+        data = bars.df
+        data['RSI'] = self.calculate_rsi(data['close'])
+        data['MACD'], _, _ = self.calculate_macd(data['close'])
+        data = self.calculate_bollinger_bands(data)
+        data = self.calculate_volatility(data)
+        data = self.calculate_atr(data)
+        data['Momentum'] = (data['close'] - data['close'].shift(5)) / data['close'].shift(5)
+        data['Price_Change'] = (data['close'] - data['open']) / data['open']
+        data.dropna(inplace=True)
 
-        last_close_price = gld["close"].iloc[-1]
-        last_known_data = gld.iloc[-1][['RSI', 'MACD']].values.reshape(1, 1, -1)
+        # LSTM Prediction (Price)
+        last_sequence = data[['RSI', 'MACD', 'SMA', 'BB_Width', '%B', 'Volatility', 'ATR', 'Momentum', 'Price_Change']].iloc[-50:, :]
+        num_rows = last_sequence.shape[0]
+        if num_rows < 50:
+            print(f"Warning: Only {num_rows} rows available, expected 50.")
+        last_sequence = last_sequence.values.reshape(1, num_rows, -1)
+        predicted_price = self.lstm_model.predict(last_sequence)[0][0]
+
+        # XGBoost Prediction (Buy/Sell)
+        last_features = data[['RSI', 'MACD', 'SMA','BB_Width','%B', 'Volatility','ATR', 'Momentum', 'Price_Change']].iloc[-1].values.reshape(1, -1)
+        signal = self.xgb_model.predict(last_features)[0]  
         
-        predicted_price = self.model.predict(last_known_data)[0][0]
-        predicted_prices = [last_close_price * np.exp(predicted_price - 0.5)] * 28
+        atr = self.calculate_atr(self.data)  # Ensure ATR is calculated in your dataset
+        cash = self.get_cash()
+        entry_price = self.get_last_price(self.selected_symbol)
 
-        future_dates = pd.date_range(gld.index[-1] + pd.Timedelta(days=1), periods=28)
-        plt.plot(gld.index, gld["close"], label="Historical Price", color="blue")
-        plt.plot(future_dates, predicted_prices, label="Predicted Price", color="orange", linestyle="dotted")
-        plt.xlabel("Date")
-        plt.ylabel("Stock Price")
-        plt.title(f"{self.stock_name} ({self.selected_symbol}) - Price vs Prediction")
-        plt.legend()
-        plt.grid()
-        plt.savefig("trade_decision.png")
-        plt.show()
+        # ATR-Based Position Sizing (Risk 2% of capital)
+        risk_per_trade = cash * 0.02 
+        atr_value = atr.iloc[-1, 0] if isinstance(atr, pd.DataFrame) else atr
+        position_size = risk_per_trade / (atr_value * 2)
+        quantity = max(1, int(position_size))
 
-    def execute_trade(self):
-        print(f"Trade executed for {self.selected_symbol}")
+        if signal == 1:
+            stop_price = entry_price - (atr * 1.5)  # Adjust multiplier based on recent volatility
+            limit_price = entry_price + (atr * 3)  # Aim for at least 2:1 risk-reward
+
+            order = Order(
+                strategy=self,
+                asset=self.selected_symbol,
+                quantity=quantity,
+                side="buy",
+                order_type="market",
+                time_in_force="gtc",
+                stop_price=stop_price,
+                limit_price=limit_price
+            )
+            print(f"Limit Price Type: {type(self.limit_price)} | Value: {limit_price}")
+            self.submit_order(order)
+                # Execute buy order
+        else:
+            position = self.get_position(symbol)
+            if position:
+                print(position)
+                stop_price = entry_price + (atr * 1.5)  # 2x ATR above for short
+                limit_price = entry_price - (atr * 3)  # 2x ATR below for short
+
+                order = Order(
+                    strategy=self,
+                    asset=self.selected_symbol,
+                    quantity=position.quantity,
+                    side="sell",
+                    order_type="market",
+                    time_in_force="gtc",
+                    stop_price=stop_price,
+                    limit_price=limit_price
+                )
+                self.submit_order(order)
+        portfolio_value = self.get_portfolio_value()
+        self.balance_history.append(portfolio_value)
+        self.plot_live()
+
+class Backtest(ML_Trend):
+    def __init__(self, data, lstm_model, xgb_model, initial_balance=100000):
+        self.data = data.df if hasattr(data, "df") else pd.DataFrame(data)
+        self.data['RSI'] = self.calculate_rsi(self.data['close'])
+        self.data['MACD'], _, _ = self.calculate_macd(self.data['close'])
+        self.data = self.calculate_bollinger_bands(self.data)
+        self.data = self.calculate_volatility(self.data)
+        self.data = self.calculate_atr(self.data)
+        self.data['Momentum'] = (self.data['close'] - self.data['close'].shift(5)) / self.data['close'].shift(5)
+        self.data['Price_Change'] = (self.data['close'] - self.data['open']) / self.data['open']
+        self.features = self.data[['RSI', 'MACD', 'SMA','BB_Width','%B', 'Volatility','ATR', 'Momentum', 'Price_Change']]
+        self.data.dropna(inplace=True)
+        self.lstm_model = lstm_model
+        self.xgb_model = xgb_model
+        self._cash_balance = initial_balance
+        self.initial_balance = initial_balance
+        self.trades = []
+        self.balance_history = []
+        self._positions = {}  
+
+    def get_cash(self):
+        return self._cash_balance  
+
+    def get_positions(self):
+        return self._positions
+
+def run(self):
+    """Runs the backtest on historical data with a live-updating graph."""
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Portfolio Value ($)")
+    ax.set_title("Backtest Performance (Live)")
+    
+    balance_line, = ax.plot([], [], color="blue", label="Portfolio Value")
+    ax.legend()
+    
+    self.balance_history = []
+    self.trades = []
+    
+    def update(frame):
+        i = frame + 50  # Start after 50 data points for LSTM
+        if i >= len(self.data):
+            ani.event_source.stop()  # Stop animation when data ends
+            return
+        
+        current_price = self.data.iloc[i]["close"]
+        
+        # Prepare input features
+        last_sequence = self.data.iloc[i-50:i][['RSI', 'MACD', 'SMA', 'BB_Width', '%B', 'Volatility', 'ATR', 'Momentum', 'Price_Change']].values.reshape(1, 50, -1)
+        last_features = self.data.iloc[i][['RSI', 'MACD', 'SMA', 'BB_Width', '%B', 'Volatility', 'ATR', 'Momentum', 'Price_Change']].values.reshape(1, -1)
+
+        # Make predictions
+        predicted_price = self.lstm_model.predict(last_sequence)[0][0]
+        signal = self.xgb_model.predict(last_features)[0]  # 1 = Buy, 0 = Sell
+
+        print(f"Predicted price= ${predicted_price:.2f} | Signal: {'BUY' if signal == 1 else 'SELL'}")
+
+        # Trading Logic
+        if signal == 1 and self._cash_balance >= current_price:  # Buy
+            self.position = self._cash_balance / current_price
+            self._cash_balance = 0
+            self.trades.append((i, current_price, "BUY"))
+
+        elif signal == 0 and self.position > 0:  # Sell
+            self._cash_balance = self.position * current_price
+            self.position = 0
+            self.trades.append((i, current_price, "SELL"))
+
+        # Track balance
+        portfolio_value = self._cash_balance + (self.position * current_price)
+        self.balance_history.append(portfolio_value)
+
+        # Update the graph
+        balance_line.set_data(range(len(self.balance_history)), self.balance_history)
+        ax.set_xlim(0, len(self.balance_history))  # Adjust X-axis dynamically
+        ax.set_ylim(min(self.balance_history), max(self.balance_history))  # Adjust Y-axis
+
+        return balance_line,
+
+    # Create the animation
+    ani = animation.FuncAnimation(fig, update, frames=len(self.data) - 50, interval=100, blit=False)
+    
+    plt.show()
+
+    final_balance = self._cash_balance + (self.position * self.data.iloc[-1]["close"])
+    print(f"Final Balance: ${final_balance:.2f} (Initial: $100000)")
+    print(f"Cash: ${self._cash_balance:.2f}, Holdings: {self.position:.2f} shares at ${self.data.iloc[-1]['close']:.2f} per share")
+
+def is_market_open():
+    url = f"{os.getenv('APCA_API_BASE_URL')}/v2/clock"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_CONFIG['API_KEY'],
+        "APCA-API-SECRET-KEY": ALPACA_CONFIG['API_SECRET']
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        return data["is_open"]  # Returns True if market is open, False otherwise
+    else:
+        print("Error:", response.json())
+        return None
 
 def search_assets(query):
     tradable_assets = [asset for asset in restAPI.list_assets() if asset.tradable]
@@ -175,10 +442,20 @@ if __name__ == "__main__":
             break
         except (ValueError, IndexError):
             print("Invalid selection. Try again.")
-
+    # if is_market_open():
     broker = Alpaca(ALPACA_CONFIG)
     strategy = ML_Trend(broker=broker, selected_symbol=selected_symbol, stock_name=stock_name)
     trader = Trader(logfile="")
     trader.add_strategy(strategy=strategy)
     time.sleep(5)
     trader.run_all()
+    # else:
+    #     broker = Alpaca(ALPACA_CONFIG)
+    #     strategy = ML_Trend(broker=broker, selected_symbol=selected_symbol, stock_name=stock_name)
+    #     print("Running backtest...")
+    #     if strategy.data is None :
+    #         print("No data available for backtesting")
+    #     else:
+    #         backtester = Backtest(strategy.data, strategy.lstm_model, strategy.xgb_model)
+    #         backtester.run()
+

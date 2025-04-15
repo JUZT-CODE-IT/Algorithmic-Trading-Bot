@@ -1,4 +1,12 @@
 import React, { useState } from "react";
+import {
+  LineChart,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Line,
+} from "recharts";
 import "./App.css";
 
 // SearchComponent definition
@@ -6,15 +14,27 @@ function SearchComponent({ setResults, setLoading }) {
   const [query, setQuery] = useState("");
 
   const searchStocks = async () => {
-    if (!query.trim()) return; // Do not search if the query is empty
-    setLoading(true); // Set loading state to true while fetching data
-    const response = await fetch(`http://localhost:5000/search?query=${query}`);
-    const data = await response.json();
-    setLoading(false); // Set loading state to false after fetching data
-    if (data.error) {
-      alert(data.error); // Alert if the query fails
-    } else {
-      setResults(data); // Set results if successful
+    if (!query.trim()) return;
+    setLoading(true);
+
+    try {
+      const response = await fetch(`http://localhost:5000/search?query=${query}`);
+      const data = await response.json();
+      setLoading(false);
+
+      if (data.error) {
+        alert(data.error);
+        setResults([]);
+      } else {
+        const formattedResults = Object.entries(data).map(([symbol, name]) => ({
+          symbol,
+          name,
+        }));
+        setResults(formattedResults);
+      }
+    } catch (error) {
+      console.error("Search Error:", error);
+      setLoading(false);
     }
   };
 
@@ -35,58 +55,152 @@ function SearchComponent({ setResults, setLoading }) {
 
 // Main TradeApp component
 export default function TradeApp() {
-  const [results, setResults] = useState({});
-  const [status, setStatus] = useState("");
+  const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [selectedStock, setSelectedStock] = useState(null); // Stores selected stock info
+  const [tradeData, setTradeData] = useState(null);
+  const [predictionData, setPredictionData] = useState(null);
+  const [showTradeImage, setShowTradeImage] = useState(false);
 
-  const startTrade = async (symbol) => {
+  const startPrediction = async (symbol, name) => {
+    setLoading(true);
     try {
-        const response = await fetch("http://localhost:5000/trade", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ symbol }),
-        });
-        const data = await response.json();
-        alert(data.status || data.error);
+      const response = await fetch("http://localhost:5000/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol }),
+      });
+
+      const data = await response.json();
+      setLoading(false);
+
+      if (!data || data.error) {
+        alert("Prediction failed");
+        return;
+      }
+
+      setSelectedStock({ symbol, name });
+      setPredictionData(data); // store full prediction object
     } catch (error) {
-        console.error("Trade Error:", error);
+      console.error("Prediction Error:", error);
+      setLoading(false);
     }
+  };
+
+  const executeTrade = async () => {
+    if (!selectedStock) return;
+
+    try {
+      const response = await fetch("http://localhost:5000/trade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: selectedStock.symbol,
+          name: selectedStock.name,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!data || !data.trade_details) {
+        alert("Invalid trade data received");
+        return;
+      }
+
+      setTradeData(data.trade_details);
+      setShowTradeImage(true);
+    } catch (error) {
+      console.error("Trade Error:", error);
+    }
+  };
+
+  const goBack = () => {
+    setSelectedStock(null);
+    setPredictionData(null);
+    setTradeData(null);
+    setShowTradeImage(false);
+    setResults([]);
   };
 
   return (
     <div className="app-container">
-      {/* Heading outside the flexbox */}
       <h1 className="heading">Stock Prediction Bot</h1>
 
-      <div className="trade-app">
-        {/* Integrate the SearchComponent here */}
-        <SearchComponent setResults={setResults} setLoading={setLoading} />
+      {/* === Trade Page === */}
+      {selectedStock && predictionData && (
+        <div className="trade-details">
+          <h2>
+            Prediction for {selectedStock.name} ({selectedStock.symbol})
+          </h2>
+          <p><strong>Prediction:</strong> {predictionData.prediction}</p>
+          <p><strong>Confidence:</strong> {predictionData.confidence || "N/A"}</p>
 
-        {/* Display the results as a grid */}
-        <div className="trade-btn-container">
-          {Object.entries(results).map(([symbol, name]) => (
-            <button
-              key={symbol}
-              onClick={() => startTrade(symbol)}
-              className="trade-btn"
-            >
-              Trade {name} ({symbol})
+          {Array.isArray(predictionData.price_data) &&
+          predictionData.price_data.length > 0 ? (
+            <div>
+              <h3>Price History</h3>
+              <LineChart width={500} height={300} data={predictionData.price_data}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis />
+                <Tooltip />
+                <Line type="monotone" dataKey="price" stroke="#82ca9d" />
+              </LineChart>
+            </div>
+          ) : (
+            <p>No price data available.</p>
+          )}
+
+          {!tradeData ? (
+            <button onClick={executeTrade} className="trade-btn">
+              Execute Trade
             </button>
-          ))}
-        </div>
+          ) : (
+            <>
+              <h3>Trade Executed</h3>
+              <p>Price: ${tradeData.price}</p>
+              <p>Status: {tradeData.order_status}</p>
+              {tradeData.model_results && (
+                <>
+                  <p>Accuracy: {tradeData.model_results.accuracy}%</p>
+                  <p>F1 Score: {tradeData.model_results.f1_score}</p>
+                </>
+              )}
+              {showTradeImage && (
+                <img
+                  src={`${process.env.PUBLIC_URL}/trade_decision.png`}
+                  alt="Trade Decision"
+                  className="rounded-lg shadow-lg"
+                />
+              )}
+            </>
+          )}
 
-        {/* Display backtest button alongside trade options */}
-        {Object.keys(results).length > 0 && (
-          <button onClick={() => {}} className="backtest-btn">
-            Backtest Strategy
+          <button onClick={goBack} className="back-btn">
+            Go Back
           </button>
-        )}
+        </div>
+      )}
 
-        {/* Show loading spinner if data is being fetched */}
-        {loading && <div className="spinner"></div>}
+      {/* === Search + Results Page === */}
+      {!selectedStock && (
+        <div className="trade-app">
+          <SearchComponent setResults={setResults} setLoading={setLoading} />
+          <div className="trade-btn-container">
+            {results.map((stock) => (
+              <button
+                key={stock.symbol}
+                onClick={() => startPrediction(stock.symbol, stock.name)}
+                className="trade-btn"
+              >
+                Trade {stock.name} ({stock.symbol})
+              </button>
+            ))}
+          </div>
 
-        <p className="status">{status}</p>
-      </div>
+          {loading && <div className="spinner"></div>}
+        </div>
+      )}
     </div>
   );
 }
