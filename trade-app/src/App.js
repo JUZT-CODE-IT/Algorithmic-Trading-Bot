@@ -53,11 +53,10 @@ function SearchComponent({ setResults, setLoading }) {
   );
 }
 
-// Main TradeApp component
 export default function TradeApp() {
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [selectedStock, setSelectedStock] = useState(null); // Stores selected stock info
+  const [selectedStock, setSelectedStock] = useState(null);
   const [tradeData, setTradeData] = useState(null);
   const [predictionData, setPredictionData] = useState(null);
   const [showTradeImage, setShowTradeImage] = useState(false);
@@ -65,24 +64,36 @@ export default function TradeApp() {
   const startPrediction = async (symbol, name) => {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:5000/predict", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol }),
+      // Step 1: Get price data from /trade
+      const tradeRes = await fetch('http://localhost:5000/trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, name }),
       });
 
-      const data = await response.json();
-      setLoading(false);
+      const priceData = await tradeRes.json();
 
-      if (!data || data.error) {
-        alert("Prediction failed");
+      // Step 2: Send price data to /predict
+      const predictRes = await fetch('http://localhost:5000/predict', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(priceData),
+      });
+
+      const prediction = await predictRes.json();
+
+      if (!prediction || prediction.error) {
+        alert('Prediction failed');
+        setLoading(false);
         return;
       }
 
       setSelectedStock({ symbol, name });
-      setPredictionData(data); // store full prediction object
+      setPredictionData(prediction);
+      setLoading(false);
     } catch (error) {
-      console.error("Prediction Error:", error);
+      console.error('Prediction error:', error);
+      alert('Prediction failed');
       setLoading(false);
     }
   };
@@ -91,9 +102,9 @@ export default function TradeApp() {
     if (!selectedStock) return;
 
     try {
-      const response = await fetch("http://localhost:5000/trade", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+      const response = await fetch('http://localhost:5000/trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbol: selectedStock.symbol,
           name: selectedStock.name,
@@ -103,14 +114,14 @@ export default function TradeApp() {
       const data = await response.json();
 
       if (!data || !data.trade_details) {
-        alert("Invalid trade data received");
+        alert('Invalid trade data received');
         return;
       }
 
       setTradeData(data.trade_details);
       setShowTradeImage(true);
     } catch (error) {
-      console.error("Trade Error:", error);
+      console.error('Trade Error:', error);
     }
   };
 
@@ -126,14 +137,13 @@ export default function TradeApp() {
     <div className="app-container">
       <h1 className="heading">Stock Prediction Bot</h1>
 
-      {/* === Trade Page === */}
       {selectedStock && predictionData && (
         <div className="trade-details">
           <h2>
             Prediction for {selectedStock.name} ({selectedStock.symbol})
           </h2>
           <p><strong>Prediction:</strong> {predictionData.prediction}</p>
-          <p><strong>Confidence:</strong> {predictionData.confidence || "N/A"}</p>
+          <p><strong>Confidence:</strong> {predictionData.confidence || 'N/A'}</p>
 
           {Array.isArray(predictionData.price_data) &&
           predictionData.price_data.length > 0 ? (
@@ -182,7 +192,6 @@ export default function TradeApp() {
         </div>
       )}
 
-      {/* === Search + Results Page === */}
       {!selectedStock && (
         <div className="trade-app">
           <SearchComponent setResults={setResults} setLoading={setLoading} />

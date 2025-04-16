@@ -13,37 +13,24 @@ import alpaca_trade_api as api
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from dotenv import load_dotenv
 from flask_cors import CORS,cross_origin
 from concurrent.futures import ThreadPoolExecutor
 from alpaca_trade_api.rest import REST
-from tensorflow.keras.models import load_model
 from flask import Flask, request, jsonify
-from LSTM import restAPI, ALPACA_CONFIG, ML_Trend, Alpaca
+from LSTM import restAPI,ALPACA_CONFIG,ML_Trend
 from alpaca.trading.stream import TradingStream
-from pydantic import BaseModel, Field
-from typing import Optional,List
+from lumibot.brokers import Alpaca
+from lumibot.strategies import Strategy
+from lumibot.traders import Trader
+from lumibot.entities import Order
+from alpaca.trading.client import TradingClient
+from flask import session
+from alpaca.data.historical import StockHistoricalDataClient
 
-class StockData(BaseModel):
-    timestamp: datetime = Field(..., alias="time")  # Adjust alias if API uses a different key
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
 
-class StockResponse(BaseModel):
-    data: List[StockData]
-
-    def to_dataframe(self) -> pd.DataFrame:
-        """Convert parsed data to a Pandas DataFrame for LSTM."""
-        df = pd.DataFrame([stock.dict() for stock in self.data])
-        df.set_index("timestamp", inplace=True)  # Set time as index
-        return df
-
+selected_symbol=None
+stock_name=None
 try:
-    lstm_model = load_model("lstm_model.h5")
-    xgb_model = joblib.load("xgboost_model.pkl")
     scaler = joblib.load("scaler.pkl")
 except Exception as e:
     print("Model loading failed. Ensure the models exist.", e)
@@ -52,13 +39,8 @@ except Exception as e:
 
 app = Flask(__name__, static_folder="build", static_url_path="")
 CORS(app, supports_credentials=True, origins=["*"])
-
-# Alpaca API Configuration
-ALPACA_CONFIG = {
-    'API_KEY': os.getenv("APCA_API_KEY_ID"),
-    'API_SECRET': os.getenv("APCA_API_SECRET_KEY"),
-    "BASE_URL": "https://paper-api.alpaca.markets"  
-}
+app.secret_key = 'finalyearproject@batch35'
+client = StockHistoricalDataClient(ALPACA_CONFIG['API_KEY'], ALPACA_CONFIG['API_SECRET'])
 restAPI = REST(ALPACA_CONFIG['API_KEY'], ALPACA_CONFIG['API_SECRET'], ALPACA_CONFIG['BASE_URL'])
 
 try:
@@ -68,7 +50,11 @@ except Exception as e:
 
 broker = Alpaca(ALPACA_CONFIG)
 trading_ws = None
-client = StockHistoricalDataClient(ALPACA_CONFIG['API_KEY'],ALPACA_CONFIG['API_SECRET'])
+trading_client = TradingClient(
+    api_key=ALPACA_CONFIG['API_KEY'],
+    secret_key= ALPACA_CONFIG['API_SECRET'],
+    paper=True
+)
  # Converts to dictionary (v2 replacement for .dict())
 
 def get_historical_prices(symbol, days=1000, timeframe='day'):
@@ -125,7 +111,7 @@ def search_assets():
 
         if not results:
             return jsonify({"message": "No matching stocks found", "results": {}})
-
+        
         return jsonify(results)
     except Exception as e:
         print(f"Error fetching assets: {e}")
@@ -185,12 +171,14 @@ def trade():
     data = request.json
     selected_symbol = data.get("symbol")
     stock_name = data.get("name")
-
+    session["symbol"] = selected_symbol
+    selected_symbol = session.get("symbol")
+    session["name"] = stock_name
+    stock_name = session.get("name")
     if not selected_symbol:
         return jsonify({"error": "Symbol is required"}), 400
 
     alpaca_data = get_historical_prices(selected_symbol)
-
     if isinstance(alpaca_data, dict) and alpaca_data:
         symbol_data = next(iter(alpaca_data.values()))  # first list inside the dict
         df = pd.DataFrame(symbol_data)
@@ -201,65 +189,12 @@ def trade():
      # This will still show the DataFrame view
     return jsonify(df.to_dict(orient="records"))
 
-def calculate_rsi(df, period=14):
-    # Calculate price differences
-    delta = df['close'].diff()
-
-    # Calculate gains and losses
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-
-    # Calculate Relative Strength (RS)
-    rs = gain / (loss + 1e-10)  # Adding a small constant to avoid division by zero
-
-    # Calculate RSI and add it to the DataFrame
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    return df
-
-def calculate_macd(df, short_period=12, long_period=26, signal_period=9):
-    # Calculate short-term and long-term EMAs
-    df['EMA_short'] = df['close'].ewm(span=short_period, adjust=False).mean()
-    df['EMA_long'] = df['close'].ewm(span=long_period, adjust=False).mean()
-    
-    # Calculate MACD
-    df['MACD'] = df['EMA_short'] - df['EMA_long']
-    
-    # Calculate Signal line
-    df['Signal'] = df['MACD'].ewm(span=signal_period, adjust=False).mean()
-    
-    # Calculate MACD Histogram
-    df['MACD_histogram'] = df['MACD'] - df['Signal']
-    
-    return df
-
-def calculate_bollinger_bands(data, window=20):
-    data['SMA'] = data['close'].rolling(window=window).mean()
-    data['STD'] = data['close'].rolling(window=window).std()
-    data['Upper_Band'] = data['SMA'] + (data['STD'] * 2)
-    data['Lower_Band'] = data['SMA'] - (data['STD'] * 2)
-    data['BB_Width'] = (4 * data['STD']) / data['SMA']
-    data['%B'] = (data['close'] - data['Lower_Band']) / (4 * data['STD'])
-    return data
-
-def calculate_volatility(data, window=20):
-    data['Volatility'] = data['close'].pct_change().rolling(window=window).std()
-    return data
-
-def calculate_atr(data, period=14):
-    high_low = data['high'] - data['low']
-    high_close = (data['high'] - data['close'].shift()).abs()
-    low_close = (data['low'] - data['close'].shift()).abs()
-    true_range = high_low.combine(high_close, max).combine(low_close, max)
-    data['ATR'] = true_range.rolling(window=period, min_periods=1).mean()
-    return data
-
-
 @app.route("/predict", methods=['POST'])
 @cross_origin(origins=['http://localhost:3000','http://localhost:5000'], supports_credentials=True)
 def predict():
     raw_json = request.get_json() # Wrap data in a list to form DataFrame
-    print("Currently in predict")
+    selected_symbol = session.get("symbol")
+    stock_name = session.get("name")
     if not raw_json:
         return jsonify({"error": "No data received"}), 400
     if isinstance(raw_json, str):  
@@ -269,9 +204,22 @@ def predict():
             return jsonify({"error": "Invalid JSON format", "details": str(e)}), 400
     parsed_data=raw_json
     df = pd.DataFrame(parsed_data)
+    strategy = ML_Trend(broker=broker, selected_symbol=selected_symbol, stock_name=stock_name,data=df)
+    strategy.data=df
+    trader = Trader(logfile="")
+    trader.add_strategy(strategy=strategy)
+
+    # Run the trader in a separate thread to avoid signal issues
+    def run_trader():
+        trader.run_all()
+
+    trader_thread = threading.Thread(target=run_trader)
+    trader_thread.start()
+    print("raw data converted to df",df.head(),sep="\n")
+    
     return jsonify(df.head().to_dict(orient="records"))
 
-def start_trading(selected_symbol, stock_name):
+def run_startegy(selected_symbol, stock_name):
     try:
         strategy = ML_Trend(broker=broker, selected_symbol=selected_symbol, stock_name=stock_name)
         strategy.run()

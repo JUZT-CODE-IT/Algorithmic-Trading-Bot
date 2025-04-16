@@ -29,7 +29,8 @@ load_dotenv("setup.env")
 ALPACA_CONFIG = {
     'API_KEY': os.getenv("APCA_API_KEY_ID"),
     'API_SECRET': os.getenv("APCA_API_SECRET_KEY"),
-    "PAPER": True
+    "PAPER": True,
+    "BASE_URL": os.getenv("APCA_API_BASE_URL")
 }
 
 restAPI = tradeapi.REST(
@@ -39,17 +40,21 @@ restAPI = tradeapi.REST(
 )
 
 class ML_Trend(Strategy):
-    def __init__(self, selected_symbol, stock_name, broker=None):
+    def __init__(self, selected_symbol, stock_name, broker=None,data=None,lstm_model=None,xgb_model=None):
         if broker:
             super().__init__(broker)
         self.broker = broker
         self.selected_symbol = selected_symbol
         self.stock_name = stock_name
+        if data is not None:
+            self.data = data
+        else:
+            self.data = self.get_historical_prices(self.selected_symbol, 1000, "day")
+        
+        # Initialize models if not passed
+        self.lstm_model = lstm_model if lstm_model is not None else self.load_lstm_model()
+        self.xgb_model = xgb_model if xgb_model is not None else self.load_xgb_model()
 
-        self.data = self.get_historical_prices(self.selected_symbol, 1000, "day")
-
-        self.lstm_model = self.load_lstm_model()
-        self.xgb_model = self.load_xgb_model()
 
     def load_lstm_model(self):
         try:
